@@ -97,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var hotKeyRef: EventHotKeyRef?
     var busy = false
+    var useHelper = false
     let ocrQueue = DispatchQueue(label: "textgrab.ocr", qos: .userInitiated)  // 所有识别都在同一个串行队列
     let defaults = UserDefaults.standard
     var keepLineBreaks: Bool {
@@ -177,10 +178,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             let t0 = Date()
-            let text = self.ocrQueue.sync { self.recognize(cg) }
-            dlog("image \(cg.width)x\(cg.height) text chars=\(text.count) ocr=\(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
+            var text: String? = self.useHelper ? nil : self.ocrQueue.sync { self.recognize(cg) }
+            if text == nil {
+                // 进程内的识别引擎坏了（常见于闲置较久后），之后都交给全新子进程
+                if !self.useHelper { dlog("in-process vision broken, switching to helper process") }
+                self.useHelper = true
+                text = self.recognizeInHelper(path: path)
+            }
+            let resultText = text ?? ""
+            dlog("image \(cg.width)x\(cg.height) helper=\(self.useHelper) text chars=\(resultText.count) ocr=\(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
             DispatchQueue.main.async {
                 self.busy = false
+                let text = resultText
                 if text.isEmpty { HUD.show("未识别到文字", symbol: "exclamationmark.triangle.fill", tint: .systemYellow); NSSound.beep(); return }
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(text, forType: .string)
@@ -190,42 +199,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func makeTextRequest(cpu: Bool) -> VNRecognizeTextRequest {
+    func makeTextRequest() -> VNRecognizeTextRequest {
         let r = VNRecognizeTextRequest()
         r.recognitionLevel = .accurate
         r.usesLanguageCorrection = true
         r.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
-        if cpu {
-            if #available(macOS 14.0, *) {
-                if let devs = try? r.supportedComputeStageDevices {
-                    for (stage, list) in devs {
-                        if let c = list.first(where: { if case .cpu = $0 { return true } else { return false } }) {
-                            r.setComputeDevice(c, for: stage)
-                        }
-                    }
-                }
-            } else {
-                r.usesCPUOnly = true
-            }
-        }
         return r
     }
 
-    func recognize(_ image: CGImage) -> String {
+    /// 返回 nil 表示 Vision 本身出错（不是“没有文字”）
+    func recognize(_ image: CGImage) -> String? {
         let codeReq = VNDetectBarcodesRequest()
-        var textReq = makeTextRequest(cpu: false)
-        // 神经网络引擎偶尔会报 e5rtError：先重试一次，再退回 CPU
-        for attempt in 0..<3 {
-            if attempt == 2 { textReq = makeTextRequest(cpu: true) }
-            else if attempt == 1 { textReq = makeTextRequest(cpu: false) }
+        var textReq = makeTextRequest()
+        var ok = false
+        for attempt in 0..<2 {
+            if attempt > 0 { textReq = makeTextRequest() }
             do {
                 try VNImageRequestHandler(cgImage: image).perform(attempt == 0 ? [textReq, codeReq] : [textReq])
-                if attempt > 0 { dlog("vision ok on attempt \(attempt)") }
+                ok = true
                 break
             } catch {
                 dlog("vision error (attempt \(attempt)): \(error)")
             }
         }
+        if !ok { return nil }
 
         let codes = (codeReq.results ?? []).compactMap { $0.payloadStringValue }
         if !codes.isEmpty { return codes.joined(separator: "\n") }  // 二维码/条形码优先
@@ -241,10 +238,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return out
     }
 
+    func recognizeInHelper(path: String) -> String? {
+        guard let exe = Bundle.main.executablePath else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = ["--ocr", path]
+        let out = Pipe()
+        p.standardOutput = out
+        do { try p.run() } catch { dlog("helper launch failed: \(error)"); return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        dlog("helper exit=\(p.terminationStatus)")
+        guard p.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     func isCJK(_ c: Character) -> Bool {
         guard let s = c.unicodeScalars.first?.value else { return false }
         return (0x3000...0x9FFF).contains(s) || (0xAC00...0xD7AF).contains(s) || (0xFF00...0xFFEF).contains(s)
     }
+}
+
+// 子进程模式：TextGrab --ocr <图片路径>，把识别结果写到 stdout
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--ocr" {
+    guard let img = NSImage(contentsOfFile: CommandLine.arguments[2]),
+          let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil),
+          let text = AppDelegate().recognize(cg) else { exit(2) }
+    FileHandle.standardOutput.write(text.data(using: .utf8)!)
+    exit(0)
 }
 
 let app = NSApplication.shared
